@@ -49,7 +49,7 @@ env:
 
 jobs:
   codex-session:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned: ubuntu-latest migrates to Ubuntu 26 on 2026-10-19
     timeout-minutes: 358 # hard ceiling under GitHub's 360-min hosted-job cap
 
     steps:
@@ -71,8 +71,8 @@ jobs:
             echo "::warning::session_minutes clamped to 340 (GitHub hosted jobs are capped at 360 minutes; ~20 min must remain for setup + save)"
             sm=340
           fi
-          if (( sm > 320 )); then
-            echo "::warning::session_minutes > 320 leaves a thin save window; consider 330 or less"
+          if (( sm > 335 )); then
+            echo "::warning::session_minutes > 335 leaves a thin save window; consider 330 or less"
           fi
 
           rd="${RETENTION_INPUT:-90}"
@@ -304,7 +304,7 @@ jobs:
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
           rm -f /tmp/fb.tar.gz /tmp/filebrowser
 
-          filebrowser --version
+          filebrowser version
           cloudflared --version
 
           # Persistent no-auth database (kept inside /runner across runs).
