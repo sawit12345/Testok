@@ -331,8 +331,10 @@ jobs:
           REF="${CODEX_WEB_REF_INPUT:-main}"
           # codex-web's `prepare` script calls the `asar` CLI to unpack the
           # Codex desktop app, so it must be on PATH before the install.
-          npm install -g @electron/asar
+          # It also calls the `sharp` CLI (sharp-cli) to build the PWA icon.
+          npm install -g @electron/asar sharp-cli
           asar --version
+          sharp --version
           # npm runs the repo's `prepare` (build + extract the Codex desktop
           # webview) and installs the `codex-web` bin on PATH.
           npm install -g "github:0xcaff/codex-web#${REF}"
