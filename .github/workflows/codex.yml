@@ -332,9 +332,14 @@ jobs:
           # codex-web's `prepare` script calls the `asar` CLI to unpack the
           # Codex desktop app, so it must be on PATH before the install.
           # It also calls the `sharp` CLI (sharp-cli) to build the PWA icon.
-          npm install -g @electron/asar sharp-cli
+          # It also needs `prettier`, and the later build steps call `vite`
+          # and `tsc`; install them globally at the project's major versions.
+          npm install -g @electron/asar sharp-cli prettier@3 vite@8 typescript@6
           asar --version
           sharp --version
+          prettier --version
+          vite --version
+          tsc --version
           # npm runs the repo's `prepare` (build + extract the Codex desktop
           # webview) and installs the `codex-web` bin on PATH.
           npm install -g "github:0xcaff/codex-web#${REF}"
