@@ -35,6 +35,10 @@ on:
         description: "Git ref of 0xcaff/codex-web to install (default: main)"
         required: false
         default: ""
+      codex_cli_version:
+        description: "@openai/codex version to install (default: latest; e.g. 0.146.0 to pin)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -159,9 +163,11 @@ jobs:
       # 5. Codex CLI                                                       #
       # ------------------------------------------------------------------ #
       - name: Install Codex CLI
+        env:
+          CODEX_CLI_VERSION_INPUT: ${{ github.event.inputs.codex_cli_version }}
         run: |
           set -euo pipefail
-          npm install -g @openai/codex
+          npm install -g "@openai/codex@${CODEX_CLI_VERSION_INPUT:-latest}"
           codex --version
 
       # ------------------------------------------------------------------ #
@@ -410,6 +416,7 @@ jobs:
               cd "$R/workspace"
               HOME="$R/home" TMPDIR="$R/tmp" CODEX_HOME="$CH" \
               CODEX_CLI_PATH="$(command -v codex)" \
+              RUST_LOG="${RUST_LOG:-warn,codex_core=debug,codex_api=debug,codex_client=debug}" \
               nohup codex-web --host 127.0.0.1 --port "$PORT_CW" \
                 >> "$R/logs/codex-web.log" 2>&1 &
             )
