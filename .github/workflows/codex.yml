@@ -1,0 +1,722 @@
+# URLs are shown in the job summary, as an annotation and inside
+# /runner/SESSION-INFO.txt (readable through the file-browser tunnel).
+#
+# End the session early (state is still saved either way):
+#   · create the file /runner/STOP through the file browser (new file, name it
+#     exactly STOP) — the watchdog ends the session within ~10 seconds, or
+#   · cancel the workflow run — the pack/upload steps still run (if: always()).
+# ==============================================================================
+
+name: Codex Web Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Minutes of usable session time (5-340; default 330 leaves ~30 min for setup+save inside GitHub's 360-min job cap)"
+        required: true
+        default: "330"
+      restore:
+        description: "Restore /runner from the newest saved artifact before starting"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - none
+      openai_api_key:
+        description: "Optional OpenAI API key written to /runner/codex-home/auth.json (falls back to repo secret OPENAI_API_KEY)"
+        required: false
+        default: ""
+      retention_days:
+        description: "Days to keep the saved /runner artifact (1-90)"
+        required: true
+        default: "90"
+      codex_web_ref:
+        description: "Git ref of 0xcaff/codex-web to install (default: main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  RUNNER_DIR: /runner
+  CODEX_HOME_DIR: /runner/codex-home
+  CODEX_WEB_PORT: "8214"
+  FILEBROWSER_PORT: "8080"
+  ARTIFACT_PREFIX: runner-state
+
+jobs:
+  codex-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358 # hard ceiling under GitHub's 360-min hosted-job cap
+
+    steps:
+      # ------------------------------------------------------------------ #
+      # 1. Validate inputs and write the session plan                      #
+      # ------------------------------------------------------------------ #
+      - name: Plan session (validate inputs)
+        env:
+          SESSION_MINUTES_INPUT: ${{ github.event.inputs.session_minutes }}
+          RETENTION_INPUT: ${{ github.event.inputs.retention_days }}
+          RESTORE_INPUT: ${{ github.event.inputs.restore }}
+        run: |
+          set -euo pipefail
+
+          sm="${SESSION_MINUTES_INPUT:-330}"
+          if ! [[ "$sm" =~ ^[0-9]+$ ]]; then sm=330; fi
+          if (( sm < 5 )); then sm=5; fi
+          if (( sm > 340 )); then
+            echo "::warning::session_minutes clamped to 340 (GitHub hosted jobs are capped at 360 minutes; ~20 min must remain for setup + save)"
+            sm=340
+          fi
+          if (( sm > 320 )); then
+            echo "::warning::session_minutes > 320 leaves a thin save window; consider 330 or less"
+          fi
+
+          rd="${RETENTION_INPUT:-90}"
+          if ! [[ "$rd" =~ ^[0-9]+$ ]]; then rd=90; fi
+          if (( rd < 1 )); then rd=1; fi
+          if (( rd > 90 )); then rd=90; fi
+          echo "RETENTION_DAYS=$rd" >> "$GITHUB_ENV"
+
+          restore="${RESTORE_INPUT:-auto}"
+
+          cat > "${RUNNER_TEMP}/session-env.sh" <<EOF
+          SESSION_MINUTES=$sm
+          RESTORE=$restore
+          EOF
+
+          {
+            echo "# Session plan"
+            echo ""
+            echo "- session length: **${sm} minutes** (usable tunnel time)"
+            echo "- restore previous /runner: **${restore}**"
+            echo "- artifact retention: **${rd} days**"
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT})"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "plan: session=${sm}min restore=${restore} retention=${rd}d"
+          df -h /
+
+      # ------------------------------------------------------------------ #
+      # 2. Reclaim disk space (unrelated preinstalled toolchains)          #
+      # ------------------------------------------------------------------ #
+      - name: Reclaim disk space (remove preinstalled toolchains Codex does not need)
+        run: |
+          set -euo pipefail
+
+          free_before=$(df -m / | awk 'NR==2{print $4}')
+
+          # Large, safely-removable toolchain dirs on ubuntu-latest images.
+          # Node/npm, python3, git, curl, build-essential are NOT touched.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/graalvm \
+            /usr/lib/jvm \
+            /opt/google \
+            /opt/microsoft \
+            2>/dev/null || true
+
+          # Docker is not used anywhere in this workflow.
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial 2>/dev/null || true
+
+          free_after=$(df -m / | awk 'NR==2{print $4}')
+          echo "disk freed: ~$(( (free_after - free_before) / 1024 )) GiB (now ${free_after} MiB available on /)"
+          df -h /
+
+      # ------------------------------------------------------------------ #
+      # 3. System utilities                                                #
+      # ------------------------------------------------------------------ #
+      - name: Install system utilities (zstd, unzip, patch)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd unzip patch >/dev/null
+          zstd --version && tar --zstd --help >/dev/null 2>&1 && echo "tar+zstd OK"
+
+      # ------------------------------------------------------------------ #
+      # 4. Node.js (for codex-web and the Codex CLI npm package)           #
+      # ------------------------------------------------------------------ #
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ------------------------------------------------------------------ #
+      # 5. Codex CLI                                                       #
+      # ------------------------------------------------------------------ #
+      - name: Install Codex CLI
+        run: |
+          set -euo pipefail
+          npm install -g @openai/codex
+          codex --version
+
+      # ------------------------------------------------------------------ #
+      # 6. Restore /runner from the previous session's artifact            #
+      # ------------------------------------------------------------------ #
+      - name: Restore /runner from previous session (if any)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/session-env.sh"
+
+          sudo mkdir -p /runner
+          sudo chown -R "$(id -un):$(id -gn)" /runner
+
+          if [ "$RESTORE" = "none" ]; then
+            echo "restore=none -> starting with a fresh /runner"
+            exit 0
+          fi
+
+          # Newest non-expired artifact whose name starts with the prefix.
+          if ! LIST=$(curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100"); then
+            echo "::warning::artifact list API failed - starting with a fresh /runner"
+            LIST="{}"
+          fi
+
+          ROW=$(printf '%s' "$LIST" | python3 -c '
+          import sys, json
+          try:
+              data = json.loads(sys.stdin.read() or "{}")
+          except ValueError:
+              raise SystemExit
+          items = [a for a in data.get("artifacts", [])
+                   if not a.get("expired")
+                   and str(a.get("name", "")).startswith("runner-state")]
+          if not items:
+              raise SystemExit
+          items.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+          a = items[0]
+          print("{}\t{}\t{}".format(a["id"], a.get("created_at", "?"),
+                                    int(a.get("size_in_bytes", 0)) // 1048576))
+          ' || true)
+
+          if [ -z "$ROW" ]; then
+            echo "no previous runner-state artifact found -> fresh /runner"
+            exit 0
+          fi
+
+          ART_ID=$(printf '%s' "$ROW" | cut -f1)
+          ART_DATE=$(printf '%s' "$ROW" | cut -f2)
+          ART_MB=$(printf '%s' "$ROW" | cut -f3)
+          echo "restoring artifact id=${ART_ID} (created ${ART_DATE}, ~${ART_MB} MiB)"
+
+          # -L follows the 302 to the signed blob URL.
+          curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" \
+            -o "${RUNNER_TEMP}/state.zip"
+
+          mkdir -p "${RUNNER_TEMP}/state"
+          unzip -q -o "${RUNNER_TEMP}/state.zip" -d "${RUNNER_TEMP}/state"
+          TARBALL=$(find "${RUNNER_TEMP}/state" -maxdepth 1 -name '*.tar.zst' | head -n1 || true)
+          if [ -z "$TARBALL" ]; then
+            echo "::warning::artifact did not contain a .tar.zst -> fresh /runner"
+            exit 0
+          fi
+          tar --zstd -xf "$TARBALL" -C /
+          rm -rf "${RUNNER_TEMP}/state" "${RUNNER_TEMP}/state.zip"
+          echo "restored /runner from ${ART_DATE}:"
+          du -sh /runner 2>/dev/null || true
+
+      # ------------------------------------------------------------------ #
+      # 7. Prepare /runner: skeleton, credentials, default Codex config    #
+      # ------------------------------------------------------------------ #
+      - name: Prepare /runner (skeleton, auth, default Codex config)
+        env:
+          OPENAI_KEY_INPUT: ${{ github.event.inputs.openai_api_key || secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          R=/runner
+          CH=/runner/codex-home
+          mkdir -p "$CH" "$R/workspace" "$R/home" "$R/logs" "$R/tmp"
+          # convenience: workspace visible from the default HOME picker dir
+          ln -sfn "$R/workspace" "$R/home/workspace"
+
+          if [ -n "${OPENAI_KEY_INPUT:-}" ]; then
+            echo "::add-mask::${OPENAI_KEY_INPUT}"
+            umask 077
+            KEY_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${OPENAI_KEY_INPUT}")
+            printf '{\n  "OPENAI_API_KEY": %s\n}\n' "$KEY_JSON" > "$CH/auth.json"
+            echo "auth.json written from workflow input / repo secret"
+          fi
+
+          if [ ! -f "$CH/auth.json" ]; then
+            echo "::warning::No OpenAI credentials found. After the tunnels are up, use the FILE BROWSER tunnel: create /runner/codex-home/auth.json containing {\"OPENAI_API_KEY\": \"sk-...\"} (or paste your local ~/.codex/auth.json), then start a NEW Codex session to pick it up."
+          fi
+          CODEX_HOME="$CH" codex login status 2>&1 || true
+
+          # Default settings only written when no previous config exists.
+          if [ ! -f "$CH/config.toml" ]; then
+            cat > "$CH/config.toml" <<'EOF'
+          # Codex settings - edit freely; NEW sessions pick changes up.
+          # Full reference: https://developers.openai.com/codex/config-reference
+          # Examples:
+          #   model = "gpt-5.2-codex"
+          #   model_reasoning_effort = "high"
+          #   [sandbox_workspace_write]
+          #   network_access = true
+
+          # Keep history bounded (see openai/codex#41806 / #24948):
+          # oldest entries are dropped beyond 50 MB. Use "none" to stop
+          # writing history.jsonl entirely.
+          [history]
+          persistence = "save-all"
+          max_bytes = 52428800
+          EOF
+            echo "wrote default config.toml"
+          fi
+
+          echo "/runner layout:"
+          du -sh "$R"/* 2>/dev/null || true
+
+      # ------------------------------------------------------------------ #
+      # 8. filebrowser (noauth) + cloudflared (trycloudflared quick tunnel)#
+      # ------------------------------------------------------------------ #
+      - name: Install filebrowser and cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/fb.tar.gz \
+            https://github.com/filebrowser/filebrowser/releases/latest/download/linux-amd64-filebrowser.tar.gz
+          tar -xzf /tmp/fb.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/filebrowser /usr/local/bin/filebrowser
+
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          rm -f /tmp/fb.tar.gz /tmp/filebrowser
+
+          filebrowser --version
+          cloudflared --version
+
+          # Persistent no-auth database (kept inside /runner across runs).
+          DB=/runner/filebrowser.db
+          if [ ! -f "$DB" ]; then
+            filebrowser config init -d "$DB" >/dev/null 2>&1
+          fi
+          if ! filebrowser config set -d "$DB" --auth.method noauth >/dev/null 2>&1; then
+            echo "::warning::filebrowser config set failed - recreating database"
+            mv "$DB" "${DB}.bak" 2>/dev/null || true
+            filebrowser config init -d "$DB" >/dev/null 2>&1
+            filebrowser config set -d "$DB" --auth.method noauth >/dev/null 2>&1
+          fi
+          filebrowser config cat -d "$DB" 2>/dev/null | sed -n '1,20p'
+
+      # ------------------------------------------------------------------ #
+      # 9. codex-web                                                       #
+      # ------------------------------------------------------------------ #
+      - name: Install codex-web
+        env:
+          CODEX_WEB_REF_INPUT: ${{ github.event.inputs.codex_web_ref }}
+        run: |
+          set -euo pipefail
+          REF="${CODEX_WEB_REF_INPUT:-main}"
+          # npm runs the repo's `prepare` (build + extract the Codex desktop
+          # webview) and installs the `codex-web` bin on PATH.
+          npm install -g "github:0xcaff/codex-web#${REF}"
+          codex-web --help || true
+
+      # ------------------------------------------------------------------ #
+      # 10. The session: services + tunnels + watchdog                     #
+      # ------------------------------------------------------------------ #
+      - name: Run session (services, tunnels, watchdog)
+        env:
+          CODEX_WEB_PORT: ${{ env.CODEX_WEB_PORT }}
+          FILEBROWSER_PORT: ${{ env.FILEBROWSER_PORT }}
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          source "${RUNNER_TEMP}/session-env.sh"
+
+          R=/runner
+          CH=/runner/codex-home
+          PORT_CW="${CODEX_WEB_PORT:-8214}"
+          PORT_FB="${FILEBROWSER_PORT:-8080}"
+
+          # budgets in MiB (edge-case caps - see header comments)
+          SESSIONS_KEEP=256      # rolling target for sessions/ + archived_sessions/
+          RUNNER_WARN=4096       # start dropping caches beyond this
+          RUNNER_MAX=6144        # hard /runner budget (artifact stays < 10 GiB)
+          LOG_CAP=64             # single codex log file cap
+          SVC_LOG_KEEP=8         # keep tail MiB of each service log
+
+          log()      { echo "[$(date -u '+%Y-%m-%d %H:%M:%SZ')] $*"; }
+          summary()  { printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; }
+
+          dir_mb() {
+            local out
+            out=$(du -sm "$1" 2>/dev/null) || out="0"
+            echo "${out%%$'\t'*}"
+          }
+
+          tail_keep() { # file, keep-MiB
+            local f="$1" keep=$(( $2 * 1048576 )) sz
+            sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -gt "$keep" ]; then
+              tail -c "$keep" "$f" > "$f.tail" && mv "$f.tail" "$f" || true
+            fi
+          }
+
+          wait_http() { # port, tries
+            local port="$1" tries="${2:-30}" i code
+            for i in $(seq 1 "$tries"); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+                     "http://127.0.0.1:${port}/" 2>/dev/null || echo 000)
+              if [ -n "$code" ] && [ "$code" != "000" ]; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          start_filebrowser() {
+            HOME="$R/home" TMPDIR="$R/tmp" nohup filebrowser \
+              -d "$R/filebrowser.db" -r "$R" -a 127.0.0.1 -p "$PORT_FB" \
+              >> "$R/logs/filebrowser.log" 2>&1 &
+          }
+
+          start_codex_web() {
+            (
+              cd "$R/workspace"
+              HOME="$R/home" TMPDIR="$R/tmp" CODEX_HOME="$CH" \
+              CODEX_CLI_PATH="$(command -v codex)" \
+              nohup codex-web --host 127.0.0.1 --port "$PORT_CW" \
+                >> "$R/logs/codex-web.log" 2>&1 &
+            )
+          }
+
+          start_tunnel() { # name, port -> echoes URL
+            local name="$1" port="$2" logf="$R/logs/cloudflared-$name.log" url="" i
+            : > "$logf"
+            nohup cloudflared tunnel --url "http://127.0.0.1:${port}" \
+              --no-autoupdate --logfile "$logf" >/dev/null 2>&1 &
+            for i in $(seq 1 60); do
+              url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$logf" 2>/dev/null | head -n1 || true)
+              if [ -n "$url" ]; then printf '%s' "$url" > "$R/tunnel-$name.url"; echo "$url"; return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          write_session_info() {
+            local cw fb ends
+            cw=$(cat "$R/tunnel-codex.url" 2>/dev/null || echo "(starting...)")
+            fb=$(cat "$R/tunnel-files.url" 2>/dev/null || echo "(starting...)")
+            ends=$(date -u -d "@$END_EPOCH" '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null || echo "?")
+            {
+              echo "CODEX SESSION INFO - refreshed $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+              echo
+              echo "  Codex web UI : $cw"
+              echo "  File browser : $fb   (root: /runner, no password)"
+              echo "  Session ends : $ends  (${SESSION_MINUTES} min after tunnels came up)"
+              echo
+              echo "HOW TO USE"
+              echo "  * Open the Codex web UI in any browser. codex-web has no login."
+              echo "  * Pick /runner/workspace as the workspace when a session asks for it."
+              echo "  * Settings : edit /runner/codex-home/config.toml via the file browser;"
+              echo "    NEW sessions pick changes up (running ones keep old settings)."
+              echo "  * Auth     : /runner/codex-home/auth.json -> {\"OPENAI_API_KEY\": \"sk-...\"}"
+              echo "    (or paste your local ~/.codex/auth.json there), then start a NEW session."
+              echo "  * Upload files you want to KEEP via the file browser into /runner/workspace."
+              echo "  * Stop early: create the file /runner/STOP via the file browser,"
+              echo "    or cancel the workflow run - /runner is saved either way."
+              echo "  * Avoid asking Codex to search /runner/codex-home itself: ingesting its"
+              echo "    own session transcripts causes runaway context growth (openai/codex#27131)."
+              echo "  * If a tunnel URL changes (restart), this file is refreshed with the new URL."
+            } > "$R/SESSION-INFO.txt"
+          }
+
+          prune_sessions() { # dir, keep-MiB
+            local d="$1" keep="$2" total drop
+            [ -d "$d" ] || return 0
+            total=$(dir_mb "$d")
+            if [ "$total" -le $(( keep + 16 )) ]; then return 0; fi
+            drop=$(( total - keep ))
+            # oldest first; never touch files modified in the last 15 min
+            local res
+            res=$(find "$d" -type f -name '*.jsonl' -mmin +15 -printf '%T@ %s %p\n' 2>/dev/null \
+              | sort -n \
+              | python3 -c '
+          import sys, os
+          drop = int(sys.argv[1]) * 1048576
+          removed = files = 0
+          for line in sys.stdin:
+              if removed >= drop:
+                  break
+              parts = line.rstrip("\n").split(None, 2)
+              if len(parts) != 3:
+                  continue
+              _, size, path = parts
+              try:
+                  os.remove(path)
+                  removed += int(size)
+                  files += 1
+              except OSError:
+                  pass
+          print("{} file(s), {} MiB".format(files, removed // 1048576))
+          ' "$drop" || true)
+            if [ -n "$res" ]; then log "prune $d: removed $res (was ${total} MiB)"; fi
+          }
+
+          prune_all() {
+            prune_sessions "$CH/sessions" "$SESSIONS_KEEP"
+            prune_sessions "$CH/archived_sessions" "$SESSIONS_KEEP"
+            local rt
+            rt=$(dir_mb "$R")
+            if [ "$rt" -gt "$RUNNER_WARN" ]; then
+              rm -rf "$R/home/.npm/_cacache" 2>/dev/null || true
+            fi
+            if [ "$rt" -gt "$RUNNER_MAX" ]; then
+              prune_sessions "$CH/sessions" 128
+              prune_sessions "$CH/archived_sessions" 128
+              echo "::warning::/runner is ${rt} MiB (budget ${RUNNER_MAX} MiB) - sessions pruned to 128 MiB each"
+            fi
+            # append-only codex logs + history + cache
+            while IFS= read -r f; do tail_keep "$f" 16; done < <(find "$CH/log" -type f -size +${LOG_CAP}M 2>/dev/null || true)
+            if [ -f "$CH/history.jsonl" ]; then tail_keep "$CH/history.jsonl" 64; fi
+            if [ "$(dir_mb "$CH/cache")" -gt 256 ]; then
+              find "$CH/cache" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            fi
+            # service logs
+            local f
+            for f in "$R/logs"/*.log; do if [ -f "$f" ]; then tail_keep "$f" "$SVC_LOG_KEEP"; fi; done
+          }
+
+          # ---------------- start everything ---------------- #
+          log "starting filebrowser (noauth, root=/runner, port $PORT_FB)"
+          start_filebrowser
+
+          log "starting codex-web (port $PORT_CW)"
+          start_codex_web
+
+          if ! wait_http "$PORT_FB" 30; then
+            log "WARN: filebrowser not answering on $PORT_FB (will keep retrying via watchdog)"
+            tail -n 20 "$R/logs/filebrowser.log" 2>/dev/null || true
+          fi
+          if ! wait_http "$PORT_CW" 60; then
+            log "WARN: codex-web not answering on $PORT_CW yet (watchdog will retry)"
+            tail -n 30 "$R/logs/codex-web.log" 2>/dev/null || true
+          fi
+
+          URL_CW=$(start_tunnel codex "$PORT_CW") || log "WARN: codex tunnel failed to come up"
+          URL_FB=$(start_tunnel files "$PORT_FB") || log "WARN: filebrowser tunnel failed to come up"
+
+          END_EPOCH=$(( $(date +%s) + SESSION_MINUTES * 60 ))
+
+          {
+            echo ""
+            echo "## Tunnels are live (no password, public internet)"
+            echo ""
+            echo "| Service | URL |"
+            echo "|---|---|"
+            echo "| Codex web UI | ${URL_CW:-FAILED} |"
+            echo "| File browser (/runner) | ${URL_FB:-FAILED} |"
+            echo ""
+            echo "Session ends at $(date -u -d "@$END_EPOCH" '+%H:%M:%SZ') (UTC), ${SESSION_MINUTES} min from now."
+            echo "Details and how-to: \`/runner/SESSION-INFO.txt\` via the file-browser tunnel."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${URL_CW:-}" ]; then echo "::notice title=Codex web URL::${URL_CW}"; fi
+          if [ -n "${URL_FB:-}" ]; then echo "::notice title=File browser URL::${URL_FB}"; fi
+          write_session_info
+
+          # ---------------- watchdog loop ---------------- #
+          log "session started - ${SESSION_MINUTES} min - URLs above"
+          tick=0
+          while :; do
+            now=$(date +%s)
+            if [ "$now" -ge "$END_EPOCH" ]; then
+              log "session time reached - wrapping up"
+              break
+            fi
+            if [ -f "$R/STOP" ]; then
+              rm -f "$R/STOP"
+              log "STOP file detected - ending session early"
+              echo "Early stop requested via /runner/STOP at $(date -u '+%Y-%m-%d %H:%M:%SZ')." >> "$GITHUB_STEP_SUMMARY"
+              break
+            fi
+
+            # tunnel liveness (quick-tunnel URLs change on restart)
+            for pair in "codex ${PORT_CW}" "files ${PORT_FB}"; do
+              # shellcheck disable=SC2086
+              set -- $pair
+              name=$1; port=$2
+              if ! pgrep -f "cloudflared tunnel --url http://127.0.0.1:${port}" >/dev/null 2>&1; then
+                log "tunnel ${name} died - restarting"
+                if new_url=$(start_tunnel "$name" "$port"); then
+                  log "tunnel ${name} back up: ${new_url}"
+                  echo "Tunnel **${name}** restarted at $(date -u '+%H:%M:%SZ') -> ${new_url}" >> "$GITHUB_STEP_SUMMARY"
+                  echo "::notice title=Tunnel ${name} restarted::${new_url}"
+                  write_session_info
+                fi
+              fi
+            done
+
+            # service liveness
+            if ! pgrep -x filebrowser >/dev/null 2>&1; then
+              log "filebrowser died - restarting"
+              start_filebrowser
+            fi
+            if ! pgrep -f 'node_modules/codex-web' >/dev/null 2>&1; then
+              log "codex-web died - restarting"
+              start_codex_web
+            fi
+
+            # housekeeping every ~5 minutes
+            if [ $(( tick % 30 )) -eq 0 ]; then
+              left=$(( (END_EPOCH - $(date +%s)) / 60 ))
+              log "heartbeat: ${left}m left | /runner $(dir_mb "$R") MiB (sessions $(dir_mb "$CH/sessions") MiB, archived $(dir_mb "$CH/archived_sessions") MiB) | disk free $(df -m / | awk 'NR==2{print $4}') MiB | cw:$(pgrep -c -f 'node_modules/codex-web' || true) fb:$(pgrep -c -x filebrowser || true) cf:$(pgrep -c -f 'cloudflared tunnel' || true)"
+              prune_all
+            fi
+
+            sleep 10
+            tick=$(( tick + 1 ))
+          done
+
+          log "session loop finished - the next steps stop services and save /runner"
+
+      # ------------------------------------------------------------------ #
+      # 11. Stop everything and pack /runner (runs even on cancel)         #
+      # ------------------------------------------------------------------ #
+      - name: Stop services and pack /runner
+        id: pack
+        if: always()
+        run: |
+          set -euo pipefail
+          R=/runner
+
+          sudo mkdir -p "$R"
+          sudo chown -R "$(id -un):$(id -gn)" "$R" 2>/dev/null || true
+          mkdir -p "$R/logs"
+
+          log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%SZ')] $*"; }
+          log "stopping services (graceful)"
+
+          pkill -f 'node_modules/codex-web' 2>/dev/null || true
+          pkill -f 'codex app-server' 2>/dev/null || true
+          pkill -x codex 2>/dev/null || true
+          pkill -x filebrowser 2>/dev/null || true
+          pkill -f 'cloudflared tunnel' 2>/dev/null || true
+          sleep 8
+          pkill -9 -f 'node_modules/codex-web' 2>/dev/null || true
+          pkill -9 -f 'codex app-server' 2>/dev/null || true
+          pkill -9 -x codex 2>/dev/null || true
+          pkill -9 -x filebrowser 2>/dev/null || true
+          pkill -9 -f 'cloudflared tunnel' 2>/dev/null || true
+          sleep 2
+          log "all services stopped"
+
+          # ---- final prune (same policy as the watchdog) ---- #
+          dir_mb() {
+            local out
+            out=$(du -sm "$1" 2>/dev/null) || out="0"
+            echo "${out%%$'\t'*}"
+          }
+          tail_keep() {
+            local f="$1" keep=$(( $2 * 1048576 )) sz
+            sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -gt "$keep" ]; then
+              tail -c "$keep" "$f" > "$f.tail" && mv "$f.tail" "$f" || true
+            fi
+          }
+          prune_sessions() {
+            local d="$1" keep="$2" total drop res
+            [ -d "$d" ] || return 0
+            total=$(dir_mb "$d")
+            if [ "$total" -le $(( keep + 16 )) ]; then return 0; fi
+            drop=$(( total - keep ))
+            res=$(find "$d" -type f -name '*.jsonl' -mmin +10 -printf '%T@ %s %p\n' 2>/dev/null \
+              | sort -n \
+              | python3 -c '
+          import sys, os
+          drop = int(sys.argv[1]) * 1048576
+          removed = files = 0
+          for line in sys.stdin:
+              if removed >= drop:
+                  break
+              parts = line.rstrip("\n").split(None, 2)
+              if len(parts) != 3:
+                  continue
+              _, size, path = parts
+              try:
+                  os.remove(path)
+                  removed += int(size)
+                  files += 1
+              except OSError:
+                  pass
+          print("{} file(s), {} MiB".format(files, removed // 1048576))
+          ' "$drop" || true)
+            if [ -n "$res" ]; then log "final prune $d: removed $res (was ${total} MiB)"; fi
+          }
+
+          CH="$R/codex-home"
+          prune_sessions "$CH/sessions" 256
+          prune_sessions "$CH/archived_sessions" 256
+          rm -rf "$R/home/.npm/_cacache" 2>/dev/null || true
+          while IFS= read -r f; do tail_keep "$f" 16; done < <(find "$CH/log" -type f -size +64M 2>/dev/null || true)
+          if [ -f "$CH/history.jsonl" ]; then tail_keep "$CH/history.jsonl" 64; fi
+          if [ "$(dir_mb "$CH/cache")" -gt 256 ]; then
+            find "$CH/cache" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          fi
+          for f in "$R/logs"/*.log; do if [ -f "$f" ]; then tail_keep "$f" 8; fi; done
+          rm -f "$R/tunnel-codex.url" "$R/tunnel-files.url" 2>/dev/null || true
+
+          # ---- pack ---- #
+          rm -f "${RUNNER_TEMP}/runner-state.tar.zst"
+          log "packing /runner -> runner-state.tar.zst"
+          tar --zstd -cf "${RUNNER_TEMP}/runner-state.tar.zst" -C / runner
+
+          PACK_MB=$(du -m "${RUNNER_TEMP}/runner-state.tar.zst" | cut -f1)
+          log "packed: ${PACK_MB} MiB (zstd)"
+          echo "PACK_MB=${PACK_MB}" >> "$GITHUB_ENV"
+          du -sh "$R"/* 2>/dev/null || true
+          df -h /
+
+      # ------------------------------------------------------------------ #
+      # 12. Upload the packed state (compression-level 0: already zstd)    #
+      # ------------------------------------------------------------------ #
+      - name: Upload /runner state artifact
+        if: always() && steps.pack.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-state-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-state.tar.zst
+          retention-days: ${{ env.RETENTION_DAYS || '90' }}
+          compression-level: 0
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------ #
+      # 13. Wrap-up                                                        #
+      # ------------------------------------------------------------------ #
+      - name: Wrap-up summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "## Session ended $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo ""
+            echo "- saved artifact: \`runner-state-a${GITHUB_RUN_ATTEMPT}\` (~${PACK_MB:-?} MiB, retention ${RETENTION_DAYS:-90}d)"
+            echo "- run this workflow again with **restore = auto** to continue with the same"
+            echo "  settings, credentials, workspace files and filebrowser database."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "done."
