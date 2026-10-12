@@ -318,6 +318,11 @@ jobs:
             filebrowser config init -d "$DB" >/dev/null 2>&1
             filebrowser config set -d "$DB" --auth.method noauth >/dev/null 2>&1
           fi
+          # noauth mode auto-logs in as user ID 1, and `config init` creates no
+          # users - without one the login page shows up. Create an admin if the
+          # database has none (harmless "already exists" error otherwise).
+          filebrowser users add admin "$(openssl rand -hex 16)" --perm.admin -d "$DB" >/dev/null 2>&1 || true
+          filebrowser users ls -d "$DB" 2>/dev/null | sed -n '1,5p' || true
           filebrowser config cat -d "$DB" 2>/dev/null | sed -n '1,20p'
 
       # ------------------------------------------------------------------ #
