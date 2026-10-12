@@ -329,20 +329,17 @@ jobs:
         run: |
           set -euo pipefail
           REF="${CODEX_WEB_REF_INPUT:-main}"
-          # codex-web's `prepare` script calls the `asar` CLI to unpack the
-          # Codex desktop app, so it must be on PATH before the install.
-          # It also calls the `sharp` CLI (sharp-cli) to build the PWA icon.
-          # It also needs `prettier`, and the later build steps call `vite`
-          # and `tsc`; install them globally at the project's major versions.
-          npm install -g @electron/asar sharp-cli prettier@3 vite@8 typescript@6
-          asar --version
-          sharp --version
-          prettier --version
-          vite --version
-          tsc --version
-          # npm runs the repo's `prepare` (build + extract the Codex desktop
-          # webview) and installs the `codex-web` bin on PATH.
-          npm install -g "github:0xcaff/codex-web#${REF}"
+          # Clone and build locally (a normal `npm install` installs all of the
+          # project's dependencies - asar, sharp-cli, prettier, vite, tsc - and
+          # runs its `prepare` build with them on PATH). Installing straight
+          # from github: builds in a temp cache dir without those deps.
+          git clone https://github.com/0xcaff/codex-web.git "$HOME/codex-web"
+          cd "$HOME/codex-web"
+          git checkout "$REF"
+          npm install
+          # Put the `codex-web` bin on PATH (symlink to this checkout).
+          npm link
+          command -v codex-web
           codex-web --help || true
 
       # ------------------------------------------------------------------ #
@@ -586,7 +583,7 @@ jobs:
               log "filebrowser died - restarting"
               start_filebrowser
             fi
-            if ! pgrep -f 'node_modules/codex-web' >/dev/null 2>&1; then
+            if ! pgrep -f 'codex-web --host' >/dev/null 2>&1; then
               log "codex-web died - restarting"
               start_codex_web
             fi
@@ -594,7 +591,7 @@ jobs:
             # housekeeping every ~5 minutes
             if [ $(( tick % 30 )) -eq 0 ]; then
               left=$(( (END_EPOCH - $(date +%s)) / 60 ))
-              log "heartbeat: ${left}m left | /runner $(dir_mb "$R") MiB (sessions $(dir_mb "$CH/sessions") MiB, archived $(dir_mb "$CH/archived_sessions") MiB) | disk free $(df -m / | awk 'NR==2{print $4}') MiB | cw:$(pgrep -c -f 'node_modules/codex-web' || true) fb:$(pgrep -c -x filebrowser || true) cf:$(pgrep -c -f 'cloudflared tunnel' || true)"
+              log "heartbeat: ${left}m left | /runner $(dir_mb "$R") MiB (sessions $(dir_mb "$CH/sessions") MiB, archived $(dir_mb "$CH/archived_sessions") MiB) | disk free $(df -m / | awk 'NR==2{print $4}') MiB | cw:$(pgrep -c -f 'codex-web --host' || true) fb:$(pgrep -c -x filebrowser || true) cf:$(pgrep -c -f 'cloudflared tunnel' || true)"
               prune_all
             fi
 
@@ -621,13 +618,13 @@ jobs:
           log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%SZ')] $*"; }
           log "stopping services (graceful)"
 
-          pkill -f 'node_modules/codex-web' 2>/dev/null || true
+          pkill -f 'codex-web --host' 2>/dev/null || true
           pkill -f 'codex app-server' 2>/dev/null || true
           pkill -x codex 2>/dev/null || true
           pkill -x filebrowser 2>/dev/null || true
           pkill -f 'cloudflared tunnel' 2>/dev/null || true
           sleep 8
-          pkill -9 -f 'node_modules/codex-web' 2>/dev/null || true
+          pkill -9 -f 'codex-web --host' 2>/dev/null || true
           pkill -9 -f 'codex app-server' 2>/dev/null || true
           pkill -9 -x codex 2>/dev/null || true
           pkill -9 -x filebrowser 2>/dev/null || true
